@@ -26,7 +26,7 @@ INTERVAL_MS = 15 * 60 * 1000
 FAST, SLOW = 7, 25
 LOOKBACK = 3          # son kaç kapanmış mumda kesişim aranacak (geciken çalışmalara tolerans)
 CANDLES = 300         # EMA'nın oturması için çekilen mum sayısı
-MIN_QUOTE_VOL = float(os.environ.get("MIN_QUOTE_VOL", "1000000"))  # 24s USDT hacim alt sınırı
+MIN_QUOTE_VOL = float(os.environ.get("MIN_QUOTE_VOL", "200000"))  # 24s USDT hacim alt sınırı
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
 # data-api.binance.vision herkese açık piyasa verisi verir ve ABD IP'lerinde de çalışır
