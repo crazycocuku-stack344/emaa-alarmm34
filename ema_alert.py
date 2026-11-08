@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Midas altcoinleri için EMA7 / EMA25 kesişim alarmı (15 dk mum) -> ntfy.
 
+Mum verisi önce Binance'ten, Binance'te olmayan coinler için MEXC'ten alınır.
+
 Kullanım:
   NTFY_TOPIC=konu-adin python ema_alert.py          # tek seferlik kontrol
   NTFY_TOPIC=konu-adin python ema_alert.py --loop   # bilgisayarda sürekli çalıştır
@@ -29,8 +31,11 @@ CANDLES = 300         # EMA'nın oturması için çekilen mum sayısı
 MIN_QUOTE_VOL = float(os.environ.get("MIN_QUOTE_VOL", "200000"))  # 24s USDT hacim alt sınırı
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
-# data-api.binance.vision herkese açık piyasa verisi verir ve ABD IP'lerinde de çalışır
-HOSTS = ["https://data-api.binance.vision", "https://api.binance.com"]
+# Öncelik sırasıyla veri kaynakları: (ad, adresler, TradingView öneki). İkisi de Binance uyumlu API kullanır.
+SOURCES = [
+    ("Binance", ["https://data-api.binance.vision", "https://api.binance.com"], "BINANCE"),
+    ("MEXC", ["https://api.mexc.com"], "MEXC"),
+]
 TR = timezone(timedelta(hours=3))
 
 # Midas kripto altcoin listesi (BTC, ETH, BNB, stablecoin ve altın tokenları hariç)
@@ -50,14 +55,14 @@ ANIME CAT MAGIC NEWT ARPA ORDER LUMIA KAT BASED RAD KERNEL RARE BMT OGN ARIA DYM
 WET SHELL HMSTR BEL ACT OPN VINE TREE SCR PRCL ZEUS ELIZAOS ATM BAR PSG ASR PORTO LAZIO JUV CITY ACM
 """.split()
 
-# Midas'taki sembol Binance'te farklıysa burada eşle
-ALIASES = {"BTT": "BTTC"}
+# Midas'taki sembol borsada farklıysa burada eşle (kaynak adı -> {Midas sembolü: borsa sembolü})
+ALIASES = {"Binance": {"BTT": "BTTC"}}
 
 
-def api(path, params=None):
+def api(hosts, path, params=None):
     query = ("?" + urllib.parse.urlencode(params)) if params else ""
     last_err = None
-    for host in HOSTS:
+    for host in hosts:
         try:
             req = urllib.request.Request(host + path + query, headers={"User-Agent": "ema-alert/1.0"})
             with urllib.request.urlopen(req, timeout=20) as r:
@@ -99,18 +104,58 @@ def find_crosses(closes):
     return found, e_fast, e_slow
 
 
-def fetch_candles(symbol):
+def load_markets():
+    """Her kaynak için {sembol: 24s USDT hacmi}. Bir kaynak erişilemezse boş döner."""
+    markets = {}
+    for name, hosts, _ in SOURCES:
+        try:
+            tickers = api(hosts, "/api/v3/ticker/24hr")
+            markets[name] = {
+                t["symbol"]: float(t.get("quoteVolume") or 0)
+                for t in tickers
+                if t["symbol"].endswith("USDT")
+            }
+        except Exception as e:
+            print(f"{name} listesi alinamadi: {e}")
+            markets[name] = {}
+    return markets
+
+
+def pick_sources(markets):
+    """Her coin için ilk uygun kaynağı seçer (hacim yeterliyse)."""
+    chosen, missing, illiquid = [], [], []
+    for coin in COINS:
+        pick, seen_any = None, False
+        for name, hosts, tv in SOURCES:
+            sym = ALIASES.get(name, {}).get(coin, coin) + "USDT"
+            if sym in markets[name]:
+                seen_any = True
+                if markets[name][sym] >= MIN_QUOTE_VOL:
+                    pick = (coin, name, hosts, tv, sym)
+                    break
+        if pick:
+            chosen.append(pick)
+        elif seen_any:
+            illiquid.append(coin)
+        else:
+            missing.append(coin)
+    return chosen, missing, illiquid
+
+
+def fetch_candles(item):
     """Sadece kapanmış mumları döndürür: (açılış_zamanları, kapanışlar)"""
+    coin, name, hosts, tv, sym = item
+    rows = None
     for attempt in range(3):
         try:
-            rows = api("/api/v3/klines", {"symbol": symbol, "interval": INTERVAL, "limit": CANDLES})
+            rows = api(hosts, "/api/v3/klines", {"symbol": sym, "interval": INTERVAL, "limit": CANDLES})
             break
         except Exception:
             if attempt == 2:
                 return None
             time.sleep(1.5)
     now_ms = int(time.time() * 1000)
-    rows = [r for r in rows if r[6] < now_ms]  # kapanmamış son mumu at
+    rows = [r for r in rows if int(r[0]) + INTERVAL_MS <= now_ms]  # kapanmamış son mumu at
     if len(rows) < SLOW + LOOKBACK + 5:
         return None
     return [int(r[0]) for r in rows], [float(r[4]) for r in rows]
@@ -134,35 +179,32 @@ def run():
     first_run = state is None
     state = state or {}
 
-    tickers = api("/api/v3/ticker/24hr")
-    volume = {t["symbol"]: float(t["quoteVolume"]) for t in tickers if t["symbol"].endswith("USDT")}
-
-    symbols, missing, illiquid = [], [], []
-    for c in COINS:
-        sym = ALIASES.get(c, c) + "USDT"
-        if sym not in volume:
-            missing.append(c)
-        elif volume[sym] < MIN_QUOTE_VOL:
-            illiquid.append(c)
-        else:
-            symbols.append(sym)
-    print(f"Izlenen: {len(symbols)} | Binance'te yok: {len(missing)} | Hacmi dusuk: {len(illiquid)}")
+    markets = load_markets()
+    chosen, missing, illiquid = pick_sources(markets)
+    per_source = {name: sum(1 for c in chosen if c[1] == name) for name, _, _ in SOURCES}
+    print(
+        f"Izlenen: {len(chosen)} ({', '.join(f'{k}: {v}' for k, v in per_source.items())}) | "
+        f"Hicbir borsada yok: {len(missing)} | Hacmi dusuk: {len(illiquid)}"
+    )
     if missing:
-        print("Binance'te yok:", " ".join(missing))
+        print("Hicbir borsada yok:", " ".join(missing))
+    if illiquid:
+        print("Hacmi dusuk:", " ".join(illiquid))
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(fetch_candles, symbols))
+        results = list(pool.map(fetch_candles, chosen))
 
     sent = 0
-    for sym, data in zip(symbols, results):
+    for item, data in zip(chosen, results):
         if not data:
             continue
+        coin, source, _, tv, sym = item
         times, closes = data
         crosses, e_fast, e_slow = find_crosses(closes)
-        coin = sym[:-4]
+        key = coin + "USDT"
         for kind, i in crosses:
             open_ms = times[i]
-            seen = state.setdefault(sym, {})
+            seen = state.setdefault(key, {})
             if open_ms <= seen.get(kind, 0):
                 continue
             seen[kind] = open_ms
@@ -176,10 +218,11 @@ def run():
             body = (
                 f"{coin}/USDT 15dk mum kapanışı ({close_time} TR)\n"
                 f"Fiyat: {fmt(closes[i])}\n"
-                f"EMA7: {fmt(e_fast[i])}  EMA25: {fmt(e_slow[i])}"
+                f"EMA7: {fmt(e_fast[i])}  EMA25: {fmt(e_slow[i])}\n"
+                f"Kaynak: {source}"
             )
             try:
-                notify(title, body, tags, click=f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}")
+                notify(title, body, tags, click=f"https://www.tradingview.com/chart/?symbol={tv}:{sym}")
                 sent += 1
             except Exception as e:
                 seen[kind] = open_ms - 1  # gönderilemedi, sonraki çalışmada tekrar dene
@@ -190,7 +233,7 @@ def run():
     if first_run:
         notify(
             "EMA alarmi kuruldu",
-            f"{len(symbols)} altcoin 15dk EMA7/EMA25 kesişimi için izleniyor. Bundan sonraki kesişimlerde bildirim gelecek.",
+            f"{len(chosen)} altcoin 15dk EMA7/EMA25 kesişimi için izleniyor. Bundan sonraki kesişimlerde bildirim gelecek.",
             "white_check_mark",
         )
         print("Ilk calistirma: baslangic durumu kaydedildi, kurulum bildirimi gonderildi.")
