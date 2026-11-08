@@ -30,6 +30,7 @@ LOOKBACK = 3          # son kaç kapanmış mumda kesişim aranacak (geciken ça
 CANDLES = 300         # EMA'nın oturması için çekilen mum sayısı
 MIN_QUOTE_VOL = float(os.environ.get("MIN_QUOTE_VOL", "200000"))  # 24s USDT hacim alt sınırı
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
+HEARTBEAT_HOUR = 9    # her gün bu saatten (TR) sonraki ilk çalışmada "sistem çalışıyor" mesajı
 
 # Öncelik sırasıyla veri kaynakları: (ad, adresler, TradingView öneki). İkisi de Binance uyumlu API kullanır.
 SOURCES = [
@@ -174,10 +175,49 @@ def load_state():
     return None
 
 
+def now_tr():
+    return datetime.now(TR)
+
+
+def throttled(meta, key, hours):
+    """Aynı uyarıyı en fazla `hours` saatte bir göndermek için True/False döndürür."""
+    now = time.time()
+    if now - meta.get(key, 0) < hours * 3600:
+        return True
+    meta[key] = now
+    return False
+
+
+def safe_notify(*args, **kwargs):
+    try:
+        notify(*args, **kwargs)
+        return True
+    except Exception as e:
+        print(f"Bildirim gonderilemedi: {e}")
+        return False
+
+
+def report_crash(err):
+    """Script hata verirse haber ver (3 saatte bir en fazla)."""
+    state = load_state()
+    meta = state.setdefault("_meta", {}) if state is not None else {}
+    if state is not None and throttled(meta, "crash_ts", 3):
+        return
+    safe_notify(
+        "EMA alarmi HATA verdi",
+        f"Script hata ile durdu: {str(err)[:200]}\nGitHub'da Actions sekmesinden log'a bak.",
+        "rotating_light",
+        priority="high",
+    )
+    if state is not None:
+        STATE_FILE.write_text(json.dumps(state))
+
+
 def run():
     state = load_state()
     first_run = state is None
     state = state or {}
+    meta = state.setdefault("_meta", {})
 
     markets = load_markets()
     chosen, missing, illiquid = pick_sources(markets)
@@ -193,6 +233,16 @@ def run():
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(fetch_candles, chosen))
+
+    problems = []
+    failed_sources = [n for n, _, _ in SOURCES if not markets[n]]
+    if failed_sources:
+        problems.append("Veri alinamayan borsa: " + ", ".join(failed_sources))
+    fetch_fail = sum(1 for d in results if not d)
+    if chosen and fetch_fail > 0.3 * len(chosen):
+        problems.append(f"{fetch_fail}/{len(chosen)} coinin mum verisi alinamadi")
+    if problems and not throttled(meta, "warn_ts", 6):
+        safe_notify("EMA alarmi uyari", "\n".join(problems), "warning")
 
     sent = 0
     for item, data in zip(chosen, results):
@@ -228,6 +278,22 @@ def run():
                 seen[kind] = open_ms - 1  # gönderilemedi, sonraki çalışmada tekrar dene
                 print(f"Bildirim gonderilemedi ({sym}): {e}")
 
+    meta["alerts"] = meta.get("alerts", 0) + sent
+    today = now_tr().strftime("%Y-%m-%d")
+    if first_run:
+        meta["heartbeat"] = today
+    elif now_tr().hour >= HEARTBEAT_HOUR and meta.get("heartbeat") != today:
+        sources = ", ".join(f"{k}: {v}" for k, v in per_source.items())
+        if safe_notify(
+            "EMA alarmi calisiyor",
+            f"Sistem çalışıyor. {len(chosen)} coin izleniyor ({sources}). "
+            f"Son 24 saatte {meta['alerts']} sinyal gönderildi.",
+            "green_heart",
+            priority="low",
+        ):
+            meta["heartbeat"] = today
+            meta["alerts"] = 0
+
     STATE_FILE.write_text(json.dumps(state))
 
     if first_run:
@@ -253,10 +319,15 @@ def main():
                 run()
             except Exception as e:
                 print("Hata:", e)
+                report_crash(e)
             now = time.time()
             time.sleep(max(5, (now // 900 + 1) * 900 + 10 - now))  # sonraki 15 dk mum kapanışı + 10 sn
     else:
-        run()
+        try:
+            run()
+        except Exception as e:
+            print("Hata:", e)
+            report_crash(e)  # bildirim gönder; çıkış kodu 0, aksi halde durum kaydedilmez ve her 15 dk'da tekrar bildirim gelir
 
 
 if __name__ == "__main__":
