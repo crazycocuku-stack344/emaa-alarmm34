@@ -1,0 +1,27 @@
+name: EMA AL Bot
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"     # 6 saatte bir yeniden baslatir
+  workflow_dispatch:           # elle de baslatabilirsin
+
+# Ayni anda iki bot calismasin, yenisi siraya girsin
+concurrency:
+  group: ema-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Botu calistir
+        run: python ema_al_bot.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOPIC_DIGER: ${{ secrets.NTFY_TOPIC_DIGER }}
+          CALISMA_SURESI_DK: "352"
