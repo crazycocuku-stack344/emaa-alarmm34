@@ -25,7 +25,8 @@ jobs:
 
       - name: Supertrend taramasi
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOPIC_5M: ${{ secrets.NTFY_TOPIC_5M }}
+          NTFY_TOPIC_15M: ${{ secrets.NTFY_TOPIC_15M }}
         run: |
           python - <<'EOF'
           #!/usr/bin/env python3
@@ -270,10 +271,11 @@ jobs:
 
 
           def main():
-              topic = os.getenv("NTFY_TOPIC")
+              topics = {"5m": os.getenv("NTFY_TOPIC_5M"), "15m": os.getenv("NTFY_TOPIC_15M")}
+              topic = topics["5m"] and topics["15m"]
               dry = os.getenv("DRY_RUN") == "1"
               if not topic and not dry:
-                  sys.exit("NTFY_TOPIC tanimli degil (GitHub Secrets'a ekle).")
+                  sys.exit("NTFY_TOPIC_5M / NTFY_TOPIC_15M tanimli degil (GitHub Secrets'a ekle).")
 
               coins = load_coins()
               if not coins:
@@ -343,7 +345,7 @@ jobs:
                       print(f"[DRY] {title} | {body.replace(chr(10), ' | ')}")
                   else:
                       try:
-                          send_ntfy(topic, title, body, click)
+                          send_ntfy(topics[tf], title, body, click)
                       except Exception as e:
                           print(f"[ntfy hata] {key}: {e}")
                           continue  # state'e yazma, bir sonraki turda tekrar dene
