@@ -1,0 +1,219 @@
+name: supertrend-alert
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: supertrend-alert
+  cancel-in-progress: false
+
+env:
+  # Coinleri buradan degistir (Binance Alpha'daki sembol adi, virgulle ayir).
+  # Istersen ALPHA_175 gibi dogrudan alpha id de yazabilirsin.
+  # Alternatif: Settings > Secrets and variables > Actions > Variables sekmesinde COINS adinda degisken olustur, o oncelikli olur.
+  COINS: ${{ vars.COINS || 'AKE,EVAA,PIEVERSE,SKYAI,MANTRA,ARIA,ZEUS,VINE,BLUR,DOS,H,INIT' }}
+  INTERVAL: "1m"
+  ATR_PERIOD: "10"
+  MULTIPLIER: "3"
+  FRESH_MINUTES: "10"
+  NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Supertrend kontrol et
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          STATE = "state.json"
+          TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+          INTERVAL = os.environ.get("INTERVAL", "1m")
+          PERIOD = int(os.environ.get("ATR_PERIOD", "10"))
+          MULT = float(os.environ.get("MULTIPLIER", "3"))
+          FRESH_MS = int(float(os.environ.get("FRESH_MINUTES", "10")) * 60000)
+          COINS = [c.strip().upper() for c in os.environ.get("COINS", "").split(",") if c.strip()]
+          BASE = "https://www.binance.com/bapi/defi/v1/public"
+          TOKEN_LIST = BASE + "/wallet-direct/buw/wallet/cex/alpha/all/token/list"
+          KLINES = BASE + "/alpha-trade/klines"
+          TR_TZ = timezone(timedelta(hours=3))
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+          def http_json(url):
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return json.load(r)
+
+          _tokens = None
+          def tokens():
+              global _tokens
+              if _tokens is None:
+                  j = http_json(TOKEN_LIST)
+                  if str(j.get("code")) != "000000":
+                      raise RuntimeError(f"token listesi alinamadi: {j.get('message')}")
+                  _tokens = j["data"]
+              return _tokens
+
+          def vol(t):
+              try:
+                  return float(t.get("volume24h") or 0)
+              except Exception:
+                  return 0.0
+
+          def resolve(entry):
+              """Coin adini alpha id'ye cevirir. Ayni adli birden fazla token varsa en yuksek 24s hacimlisini secer."""
+              if entry.startswith("ALPHA_"):
+                  return entry, "dogrudan alpha id"
+              live = [t for t in tokens() if not t.get("offline")]
+              cands = [t for t in live if str(t.get("symbol", "")).upper() == entry]
+              if not cands:
+                  cands = [t for t in live if str(t.get("name", "")).upper() == entry]
+              if not cands:
+                  return None
+              best = max(cands, key=vol)
+              addr = str(best.get("contractAddress", ""))
+              info = f"{best.get('chainName')} {addr[:8]}..{addr[-4:]} hacim24s={vol(best):,.0f}"
+              if len(cands) > 1:
+                  info += f" ({len(cands)} aday icinden)"
+              return best["alphaId"], info
+
+          def get_candles(alpha_id):
+              j = http_json(f"{KLINES}?symbol={alpha_id}USDT&interval={INTERVAL}&limit=500")
+              if str(j.get("code")) != "000000":
+                  raise RuntimeError(f"klines hatasi: {j.get('message')}")
+              now_ms = int(time.time() * 1000)
+              rows = [x for x in j["data"] if int(x[6]) < now_ms]  # sadece kapanmis mumlar
+              cs = [{"t": int(x[0]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+              cs.sort(key=lambda k: k["t"])
+              return cs
+
+          def directions(cs):
+              n = len(cs)
+              if n <= PERIOD + 1:
+                  return None
+              tr = []
+              for i, k in enumerate(cs):
+                  if i == 0:
+                      tr.append(k["h"] - k["l"])
+                  else:
+                      pc = cs[i - 1]["c"]
+                      tr.append(max(k["h"] - k["l"], abs(k["h"] - pc), abs(k["l"] - pc)))
+              atr = [None] * n
+              atr[PERIOD - 1] = sum(tr[:PERIOD]) / PERIOD
+              for i in range(PERIOD, n):
+                  atr[i] = (atr[i - 1] * (PERIOD - 1) + tr[i]) / PERIOD
+              dirs = [0] * n
+              fu = [None] * n
+              fl = [None] * n
+              d = 1
+              for i in range(PERIOD - 1, n):
+                  hl2 = (cs[i]["h"] + cs[i]["l"]) / 2
+                  up = hl2 + MULT * atr[i]
+                  lo = hl2 - MULT * atr[i]
+                  if i == PERIOD - 1:
+                      fu[i], fl[i] = up, lo
+                  else:
+                      pc = cs[i - 1]["c"]
+                      fl[i] = lo if (lo > fl[i - 1] or pc < fl[i - 1]) else fl[i - 1]
+                      fu[i] = up if (up < fu[i - 1] or pc > fu[i - 1]) else fu[i - 1]
+                      c = cs[i]["c"]
+                      if d == 1 and c < fl[i]:
+                          d = -1
+                      elif d == -1 and c > fu[i]:
+                          d = 1
+                  dirs[i] = d
+              return dirs
+
+          def last_flip_up(cs):
+              """Supertrend su an yesilse, kirmizidan yesile en son donusun mum indeksini dondurur."""
+              dirs = directions(cs)
+              if dirs is None or dirs[-1] != 1:
+                  return None
+              for i in range(len(cs) - 1, PERIOD, -1):
+                  if dirs[i] == 1 and dirs[i - 1] == -1:
+                      return i
+              return None
+
+          def notify(title, msg, tags="green_circle,chart_with_upwards_trend", priority="high"):
+              print(f"[bildirim] {title}: {msg}")
+              if not TOPIC:
+                  print("NTFY_TOPIC tanimli degil, bildirim gonderilmedi.")
+                  return
+              req = urllib.request.Request(
+                  f"https://ntfy.sh/{TOPIC}",
+                  data=msg.encode("utf-8"),
+                  headers={"Title": title, "Priority": priority, "Tags": tags},
+                  method="POST",
+              )
+              urllib.request.urlopen(req, timeout=15).read()
+
+          state = {}
+          if os.path.exists(STATE):
+              with open(STATE, encoding="utf-8") as f:
+                  state = json.load(f)
+
+          ok = 0
+          for entry in COINS:
+              s = state.setdefault(entry, {})
+              try:
+                  r = resolve(entry)
+              except Exception as e:
+                  print(f"{entry}: token listesi hatasi ({e})")
+                  continue
+              if r is None:
+                  print(f"{entry}: Alpha listesinde bulunamadi")
+                  if not s.get("missing_notified"):
+                      notify(f"BULUNAMADI {entry}", f"{entry} Binance Alpha listesinde yok. Yazimi kontrol et.", "warning", "default")
+                      s["missing_notified"] = True
+                  continue
+              s.pop("missing_notified", None)
+              alpha_id, info = r
+              try:
+                  cs = get_candles(alpha_id)
+              except Exception as e:
+                  print(f"{entry} ({alpha_id}): mum verisi alinamadi ({e})")
+                  continue
+              ok += 1
+              if not cs:
+                  print(f"{entry} ({alpha_id}): mum yok")
+                  continue
+              idx = last_flip_up(cs)
+              price = cs[-1]["c"]
+              now_ms = int(time.time() * 1000)
+              fresh = idx is not None and (now_ms - cs[idx]["t"]) <= FRESH_MS
+              print(f"{entry} ({alpha_id}, {info}): son kapanis {price:.8g}, yeni yesil sinyal: {'evet' if fresh else 'hayir'}")
+              if not fresh:
+                  continue
+              flip_t = cs[idx]["t"]
+              if flip_t <= s.get("last_flip", 0):
+                  continue
+              when = datetime.fromtimestamp(flip_t / 1000, TR_TZ).strftime("%H:%M")
+              notify(
+                  f"SUPERTREND YESIL {entry}",
+                  f"{entry} (Alpha) {INTERVAL} Supertrend({PERIOD},{MULT:g}) yesile dondu. Sinyal mumu: {when}, son kapanis: {price:.8g} USDT. {info}",
+              )
+              s["last_flip"] = flip_t
+
+          with open(STATE, "w", encoding="utf-8") as f:
+              json.dump(state, f, indent=2)
+
+          if COINS and ok == 0:
+              sys.exit(1)
+          PY
+
+      - name: Durumu kaydet
+        run: |
+          git config user.name "supertrend-bot"
+          git config user.email "supertrend-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "state" && git pull --rebase && git push)
