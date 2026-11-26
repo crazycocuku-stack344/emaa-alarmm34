@@ -1,15 +1,15 @@
 {
   "AKE": {
-    "last_flip": 1795665780000
+    "last_flip": 1795703280000
   },
   "EVAA": {
-    "last_flip": 1795665120000
+    "last_flip": 1795699920000
   },
   "PIEVERSE": {
-    "last_flip": 1795662900000
+    "last_flip": 1795705080000
   },
   "SKYAI": {
-    "last_flip": 1795663800000
+    "last_flip": 1795704780000
   },
   "MANTRA": {
     "missing_notified": true
@@ -17,21 +17,23 @@
   "ARIA": {
     "missing_notified": true
   },
-  "ZEUS": {},
+  "ZEUS": {
+    "last_flip": 1795699620000
+  },
   "VINE": {
-    "last_flip": 1795659900000
+    "last_flip": 1795700400000
   },
   "BLUR": {
-    "last_flip": 1795663380000
+    "last_flip": 1795704780000
   },
   "DOS": {
-    "last_flip": 1795662780000
+    "last_flip": 1795705080000
   },
   "H": {
-    "last_flip": 1795659120000
+    "last_flip": 1795701840000
   },
   "INIT": {
-    "last_flip": 1795664160000
+    "last_flip": 1795701840000
   },
   "OM": {}
 }
